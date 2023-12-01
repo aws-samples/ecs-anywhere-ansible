@@ -1,0 +1,6 @@
+---
+key: '<AWS Access Key>'
+secret: '<AWS Access Secret>'
+cluster: '<Name of your ECS Cluster>'
+region: '<Region your ECS Cluster resides in>'
+role: '<Name of your ECS Anywhere IAM Role>'

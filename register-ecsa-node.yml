@@ -1,0 +1,178 @@
+---
+-
+  hosts: default
+  vars_files:
+    - ./vars/vars.yml
+  environment:
+    - AWS_ACCESS_KEY_ID: "{{ key }}"
+    - AWS_SECRET_ACCESS_KEY: "{{ secret }}"
+  tasks:
+    ##############################################################
+    #
+    # PREREQS
+    #
+    ##############################################################
+    -
+      name: "OS Updates"
+      become: true
+      block:
+        -
+          name: OS Updates (RHEL based distros)
+          yum:
+            name: '*'
+            state: latest
+            update_cache: true
+          when: ansible_os_family == 'RedHat'
+        -
+          name: OS Updates (Debian based distros)
+          apt:
+            name: '*'
+            state: latest
+            update_cache: true
+          when: ansible_os_family == 'Debian'
+    -
+      name: "Prereqs Install"
+      become: true
+      block:
+        -
+          name: "Prereqs Install (RHEL based distros)"
+          yum:
+            name: 'python3-pip,jq,curl'
+            state: latest
+            update_cache: true
+          when: ansible_os_family == 'RedHat'
+        -
+          name: "Prereqs Install (Debian based distros)"
+          apt:
+            name: 'python3-pip,jq,curl'
+            state: latest
+            update_cache: true
+          when: ansible_os_family == 'Debian'
+    -
+      name: "AWS CLI Install"
+      become: true
+      block:
+        -
+          name: AWS CLI Install (RHEL based distros)
+          yum:
+            name: 'awscli'
+            state: latest
+            update_cache: true
+          when: ansible_os_family == 'RedHat'
+        -
+          name: AWS CLI Install (Debian based distros)
+          apt:
+            name: 'awscli'
+            state: latest
+            update_cache: true
+          when: ansible_os_family == 'Debian'
+    ##############################################################
+    #
+    # INSTALL BOTO3 and BOTOCORE
+    #
+    ##############################################################
+    -
+      name: "Install boto3 and botocore python libraries"
+      pip:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - boto3
+        - botocore
+      vars:
+        - ansible_python_interpreter: /usr/bin/python3
+    ##############################################################
+    #
+    # VALIDATE ECS CLUSTER AND IAM ROLE
+    #
+    ##############################################################
+    -
+      name: "Ensure Specified Cluster Exists"
+      community.aws.ecs_cluster:
+        name: "{{ cluster }}"
+        region: "{{ region }}"
+        state: present
+      run_once: true
+      vars:
+        - ansible_python_interpreter: /usr/bin/python3
+    -
+      name: "Ensure ecsAnywhereRole IAM Role Exists"
+      community.aws.iam_role:
+        name: "{{ role }}"
+        assume_role_policy_document: "{{ lookup('file', 'files/iam-assume-role-policy.json') }}"
+        managed_policies:
+          - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+          - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        state: present
+      run_once: true
+      vars:
+        - ansible_python_interpreter: /usr/bin/python3
+    ##############################################################
+    #
+    # REGISTER ECS-A NODE
+    #
+    ##############################################################
+    -
+      name: "AWS CLI Install"
+      become: true
+      vars:
+        - ansible_python_interpreter: /usr/bin/python3
+      block:
+        -
+          name: "Find the Instance Id from local IP Address in SSM"
+          shell: aws ssm describe-instance-information --region "{{ region }}" | jq ".InstanceInformationList[] | select(.IPAddress==\"{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}\") | .InstanceId" | tr -d '"'
+          register: instanceId
+        -
+          name: "Retrieve SSM activation data"
+          shell: "aws ssm create-activation --iam-role {{ role }} --region {{ region }}"
+          register: ecs_activation_output
+          when: instanceId.stdout == ''
+        - 
+          name: "Setting the ecs_activation_id and ecs_activation_code variables"
+          set_fact: 
+            ecs_activation_id: "{{ (ecs_activation_output.stdout | from_json).ActivationId }}"
+            ecs_activation_code: "{{ (ecs_activation_output.stdout | from_json).ActivationCode }}"
+          no_log: true
+          when: instanceId.stdout == ''
+        -
+          name: "Download Latest Registration Script"
+          get_url:
+            url: https://amazon-ecs-agent.s3.amazonaws.com/ecs-anywhere-install-latest.sh
+            dest: /tmp/ecs-anywhere-install.sh
+            mode: 0440
+          when: instanceId.stdout == ''
+        -
+          name: "Register the Server"
+          shell: "bash /tmp/ecs-anywhere-install.sh --region {{ region }} --cluster {{ cluster }} --activation-id {{ ecs_activation_id }} --activation-code {{ ecs_activation_code }}"
+          when: instanceId.stdout == ''
+        -
+          name: "Remove Registration Script"
+          file:
+            path: /tmp/ecs-anywhere-install.sh
+            state: absent
+        -
+          name: "Find the Instance Id from local IP Address in SSM"
+          shell: aws ssm describe-instance-information --region "{{ region }}" | jq ".InstanceInformationList[] | select(.IPAddress==\"{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}\") | .InstanceId" | tr -d '"'
+          register: instanceId
+        -
+          name: "Find the Container Instance Arn based on EC2 Instance Id"
+          args:
+            executable: /bin/bash
+          shell: |
+            instances=$(aws ecs list-container-instances --cluster "{{ cluster }}" --region "{{ region }}" | jq -c '.containerInstanceArns')
+            aws ecs describe-container-instances --cluster "{{ cluster }}" --region "{{ region }}" --container-instances $instances | \
+              jq ".containerInstances[] | select(.ec2InstanceId==\"{{ instanceId.stdout }}\") | .containerInstanceArn" | tr -d '"'
+          register: ecsInstanceArn
+          when: instanceId.stdout != ''
+        -
+          name: "Reboot Server"
+          async: 1
+          ignore_errors: true
+          poll: 0
+          shell: "sleep 2 && shutdown -r now 'reboot initiated by ansible'"
+          when: instanceId.stdout == '' or ecsInstanceArn.stdout == ''
+        -
+          name: "Wait for Host to come back up"
+          become: false
+          local_action: "wait_for host={{ inventory_hostname }} port=22 delay=20"
+          when: instanceId.stdout == '' or ecsInstanceArn.stdout == ''

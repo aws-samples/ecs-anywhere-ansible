@@ -1,0 +1,32 @@
+Description: >
+  This template deploys an ECS service with nginx webserver that is intended to run on ECS external instances
+
+Resources:
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: nginx-on-ecs-anywhere
+      RequiresCompatibilities:
+      - EXTERNAL
+      ContainerDefinitions:
+      - Name: nginx
+        Image: nginx:latest
+        Memory: 128
+        PortMappings:
+        - ContainerPort: 80
+          Protocol: tcp
+    
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: nginx-service-ecs-anywhere
+      Cluster: !ImportValue ECSAnywhereClusterArn
+      TaskDefinition:
+        Ref: ECSTaskDefinition
+      LaunchType: EXTERNAL
+      DesiredCount: 2
+
+
+      
+        
+

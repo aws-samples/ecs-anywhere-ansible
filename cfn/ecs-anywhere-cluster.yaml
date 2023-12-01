@@ -1,0 +1,48 @@
+Description: >
+  This template deploys an ECS anywhere IAM role and a bare ECS cluster
+
+Parameters:
+  ClusterName:
+    Type: String
+    Description: Desired name for your ECS Anywhere cluster
+  ECSAnywhereRoleName:
+    Type: String
+    Description: Desired role name that will be used by the ECS external servers to communicate with AWS APIs
+    Default: ECSAnywhereRole
+
+Resources:
+  ECSAnywhereRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Ref: ECSAnywhereRoleName
+      Description: This IAM role is used by the ECS external servers/VMs to communicate with AWS APIs.
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - sts:AssumeRole
+          Principal:
+            Service:
+            - ssm.amazonaws.com  
+
+  ECSAnywhereCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName:
+        Ref: ClusterName
+
+Outputs:
+  ECSAnywhereRole:
+    Description: This IAM role is used by the ECS external servers/VMs to communicate with AWS APIs
+    Value: !GetAtt ECSAnywhereRole.Arn
+
+  ECSAnywhereCluster:
+    Description: A reference to the ECS cluster
+    Value: !GetAtt ECSAnywhereCluster.Arn
+    Export:
+      Name: ECSAnywhereClusterArn

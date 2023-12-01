@@ -1,0 +1,110 @@
+---
+-
+  hosts: default
+  serial: 1
+  vars_files:
+    - ./vars/vars.yml
+  environment:
+    - AWS_ACCESS_KEY_ID: "{{ key }}"
+    - AWS_SECRET_ACCESS_KEY: "{{ secret }}"
+  tasks:
+    -
+      name: "Deregister the instance"
+      become: true
+      vars:
+        - ansible_python_interpreter: /usr/bin/python3
+      block:
+        -
+          set_fact:
+            continueDerigister: true
+        -
+          name: "Find the Instance Id from local IP Address in SSM"
+          shell: aws ssm describe-instance-information --region "{{ region }}" | jq ".InstanceInformationList[] | select(.IPAddress==\"{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}\") | .InstanceId" | tr -d '"'
+          register: instanceId
+        -
+          name: "Find the Container Instance Arn based on EC2 Instance Id"
+          args:
+            executable: /bin/bash
+          shell: |
+            instances=$(aws ecs list-container-instances --cluster "{{ cluster }}" --region "{{ region }}" | jq -c '.containerInstanceArns')
+            aws ecs describe-container-instances --cluster "{{ cluster }}" --region "{{ region }}" --container-instances $instances | \
+              jq ".containerInstances[] | select(.ec2InstanceId==\"{{ instanceId.stdout }}\") | .containerInstanceArn" | tr -d '"'
+          register: ecsInstanceArn
+          when: instanceId.stdout != ''
+        -
+          name: "Drain the Container Instance (allow up to 10 minutes)"
+          args:
+            executable: /bin/bash
+          shell: |
+            aws ecs update-container-instances-state --cluster "{{ cluster }}" --region "{{ region }}" --container-instances "{{ ecsInstanceArn.stdout }}" --status DRAINING
+            x=1
+            while :
+            do
+              x=$(($x + 1))
+              validate=$(aws ecs describe-container-instances --cluster "{{ cluster }}" --region "{{ region }}" --container-instances "{{ ecsInstanceArn.stdout }}")
+              running=$(echo $validate | jq '.containerInstances[0].runningTasksCount')
+              pending=$(echo $validate | jq '.containerInstances[0].pendingTasksCount')
+              if (($running == '0' && $pending == '0'))
+              then
+                break
+              else
+                if (($x > 200))
+                then
+                  echo "unable to drain instance, please ensure you have enough resources to reschedule all tasks"
+                  aws ecs update-container-instances-state --cluster "{{ cluster }}" --region "{{ region }}" --container-instances "{{ ecsInstanceArn.stdout }}" --status ACTIVE
+                  break
+                fi
+                sleep 3
+              fi
+            done
+          register: drain
+          when: instanceId.stdout != ''
+        -
+          name: "Print out if we were unable to drain the instance"
+          debug:
+            msg: "unable to drain instance, please ensure you have enough resources to reschedule all tasks"
+          when: instanceId.stdout != '' and drain.stdout is search('unable to drain instance, please ensure you have enough resources to reschedule all tasks')
+        -
+          name: "Set variable to skip remaining actions"
+          set_fact:
+            continueDerigister: false
+          when: instanceId.stdout != '' and drain.stdout is search('unable to drain instance, please ensure you have enough resources to reschedule all tasks')
+        -
+          name: "Deregister Container Instance from ECS"
+          shell: aws ecs deregister-container-instance --cluster "{{ cluster }}" --region "{{ region }}" --container-instance "{{ ecsInstanceArn.stdout }}"
+          when: instanceId.stdout != '' and continueDerigister == true
+        -
+          name: "Deregister Container Instance from SSM"
+          shell: aws ssm deregister-managed-instance --region "{{ region }}" --instance-id "{{ instanceId.stdout }}"
+          when: instanceId.stdout != '' and continueDerigister == true
+        -
+          name: "Stop the SSM Agent"
+          service:
+            name: 'amazon-ssm-agent'
+            state: stopped
+          when: instanceId.stdout != '' and continueDerigister == true
+        -
+          name: "Remove the ECS and SSM packages (RHEL based distros)"
+          yum:
+            name: 'amazon-ecs-init,amazon-ssm-agent'
+            state: absent
+          when: ansible_os_family == 'RedHat' and instanceId.stdout != '' and continueDerigister == true
+        -
+          name: "Remove the ECS and SSM packages (Debian based distros)"
+          apt:
+            name: 'amazon-ecs-init,amazon-ssm-agent'
+            state: absent
+          when: ansible_os_family == 'Debian' and instanceId.stdout != '' and continueDerigister == true
+        -
+          name: "Clean up ECS and SSM Directories"
+          file:
+            path: "{{ item }}"
+            state: absent
+          with_items:
+            - /var/lib/ecs
+            - /etc/ecs
+            - /var/lib/amazon/ssm
+            - /var/log/ecs
+            - /var/log/amazon/ssm
+            - /tmp/ecs-anywhere-install.sh
+          when: instanceId.stdout != '' and continueDerigister == true
